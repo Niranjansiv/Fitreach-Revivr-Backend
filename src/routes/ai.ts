@@ -1,134 +1,108 @@
-import { Router, Request, Response } from "express";
-import Anthropic from "@anthropic-ai/sdk";
+import { Router } from 'express'
+import axios from 'axios'
+import dotenv from 'dotenv'
+dotenv.config()
 
-const router = Router();
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const router = Router()
+const GROQ_API_KEY = process.env.GROQ_API_KEY || ''
 
-const SYSTEM_PROMPT = `You are the FitReach Revivr AI assistant — an expert in fitness member retention and engagement strategy.
-You have access to member data including engagement scores, churn risk levels (LOW/MEDIUM/HIGH), membership types (GOLD/SILVER/BASIC), visit history, and communication logs.
-Help gym operators reduce churn, craft targeted messages, and build smart member segments.
-Be concise, data-driven, and actionable.`;
+console.log('Groq Key exists:', !!GROQ_API_KEY)
 
-router.post("/chat", async (req: Request, res: Response) => {
-  try {
-    const { message, history } = req.body as {
-      message: string;
-      history?: Array<{ role: "user" | "assistant"; content: string }>;
-    };
+if (!GROQ_API_KEY) {
+  console.error('GROQ_API_KEY not set!')
+}
 
-    if (!message) {
-      res.status(400).json({ error: "message is required" });
-      return;
-    }
-
-    const messages: Anthropic.MessageParam[] = [
-      ...(history ?? []).map((h) => ({ role: h.role, content: h.content })),
-      { role: "user", content: message },
-    ];
-
-    const response = await anthropic.messages.create({
-      model: "claude-opus-4-8",
+const callGroq = async (systemPrompt: string, userMessage: string) => {
+  const response = await axios.post(
+    'https://api.groq.com/openai/v1/chat/completions',
+    {
+      model: 'llama-3.1-8b-instant',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage },
+      ],
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      messages,
-    });
+      temperature: 0.7,
+    },
+    {
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    },
+  )
+  return response.data.choices[0].message.content
+}
 
-    const text = response.content.find((b) => b.type === "text");
-    res.json({ response: text?.type === "text" ? text.text : "" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "AI chat failed" });
-  }
-});
+const SYSTEM_CONTEXT = `You are an AI assistant for FitReach Revivr, a fitness member retention CRM.
+Help fitness studio managers identify at-risk members, create campaigns, and improve member retention.
 
-router.post("/draft-message", async (req: Request, res: Response) => {
+Current studio data:
+Total members: 50
+High churn risk members: 18
+Gold members: 15
+Silver members: 20
+Basic members: 15
+Average engagement score: 52%
+
+Be concise, helpful and actionable.
+When drafting messages use motivational fitness tone.`
+
+router.post('/chat', async (req: any, res: any) => {
   try {
-    const { segmentName, channel, tone, memberCount } = req.body as {
-      segmentName: string;
-      channel: string;
-      tone: string;
-      memberCount: number;
-    };
+    const { message, history = [] } = req.body
+    console.log('AI chat called:', message)
 
-    if (!segmentName || !channel || !tone) {
-      res.status(400).json({ error: "segmentName, channel, and tone are required" });
-      return;
-    }
+    const aiResponse = await callGroq(SYSTEM_CONTEXT, message)
 
-    const response = await anthropic.messages.create({
-      model: "claude-opus-4-8",
-      max_tokens: 512,
-      system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: `Draft a ${channel} message for the "${segmentName}" segment (${memberCount ?? "unknown number of"} members). Tone: ${tone}. Return only the message text, no explanation.`,
-        },
-      ],
-    });
-
-    const text = response.content.find((b) => b.type === "text");
-    res.json({ message: text?.type === "text" ? text.text : "" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Draft message failed" });
+    console.log('Groq response generated')
+    res.json({ response: aiResponse, success: true })
+  } catch (error: any) {
+    console.error('Groq Error:', error.message)
+    res.status(500).json({ error: error.message })
   }
-});
+})
 
-router.post("/segment", async (req: Request, res: Response) => {
+router.post('/draft-message', async (req: any, res: any) => {
   try {
-    const { prompt } = req.body as { prompt: string };
+    const { segmentName, channel, tone, memberCount } = req.body
 
-    if (!prompt) {
-      res.status(400).json({ error: "prompt is required" });
-      return;
-    }
+    const message = await callGroq(
+      'You are a fitness marketing expert.',
+      `Write a short ${tone || 'motivational'} ${channel || 'WhatsApp'} message for ${memberCount || 'some'} fitness members in the "${segmentName || 'general'}" segment. Use {name} placeholder. Max 160 characters.`,
+    )
 
-    const response = await anthropic.messages.create({
-      model: "claude-opus-4-8",
-      max_tokens: 512,
-      system: SYSTEM_PROMPT,
-      messages: [
-        {
-          role: "user",
-          content: `Convert this natural language description into segment filters and an insight.
-
-Description: "${prompt}"
-
-Respond with valid JSON only, in this exact shape:
-{
-  "filters": {
-    "churnRisk": "HIGH" | "MEDIUM" | "LOW" | null,
-    "membershipType": "GOLD" | "SILVER" | "BASIC" | null
-  },
-  "insight": "<one sentence explaining who this segment targets and why>"
-}`,
-        },
-      ],
-    });
-
-    const text = response.content.find((b) => b.type === "text");
-    if (!text || text.type !== "text") {
-      res.status(500).json({ error: "No response from AI" });
-      return;
-    }
-
-    const jsonMatch = text.text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
-      res.status(500).json({ error: "Could not parse AI response" });
-      return;
-    }
-
-    const parsed = JSON.parse(jsonMatch[0]) as {
-      filters: { churnRisk: string | null; membershipType: string | null };
-      insight: string;
-    };
-
-    res.json(parsed);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Segment generation failed" });
+    res.json({ message })
+  } catch (error: any) {
+    res.status(500).json({ error: error.message })
   }
-});
+})
 
-export default router;
+router.post('/segment', async (req: any, res: any) => {
+  try {
+    const { prompt } = req.body
+
+    const result = await callGroq(
+      'You are a data analyst for a fitness CRM. Respond only with valid JSON.',
+      `Convert this to member filters: "${prompt}"
+
+Available filters:
+churnRisk: HIGH, MEDIUM, LOW
+membershipType: GOLD, SILVER, BASIC
+
+Respond ONLY with this JSON format:
+{"filters":{"churnRisk":"HIGH"},"insight":"explanation","estimatedCount":18}`,
+    )
+
+    try {
+      const parsed = JSON.parse(result.replace(/```json|```/g, '').trim())
+      res.json(parsed)
+    } catch {
+      res.json({ filters: {}, insight: result, estimatedCount: 0 })
+    }
+  } catch (error: any) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
+export default router
